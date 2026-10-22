@@ -1,0 +1,349 @@
+diff --git a/app/src/main/cpp/waylandcomp/src/compositor.c b/app/src/main/cpp/waylandcomp/src/compositor.c
+index 983d8ab..a1fb924 100644
+--- a/app/src/main/cpp/waylandcomp/src/compositor.c
++++ b/app/src/main/cpp/waylandcomp/src/compositor.c
+@@ -343,7 +343,7 @@ static int buffer_release_blocked(struct wl_resource *buffer) {
+  * not acquired"). Off on an Adreno. */
+ static int g_buf_trace = -1;
+ static int g_buf_trace_left = 400;
+-static uint32_t g_released_ids[128];
++static struct { struct wl_client *client; uint32_t id; } g_released_ids[128];
+ static int buf_trace_on(void) {
+     if (g_buf_trace < 0) g_buf_trace = access("/dev/kgsl-3d0", F_OK) != 0;
+     return g_buf_trace;
+@@ -351,25 +351,34 @@ static int buf_trace_on(void) {
+ static void buf_trace_attach(struct wl_resource *buffer) {
+     if (!buffer || !buf_trace_on()) return;
+     uint32_t id = wl_resource_get_id(buffer);
+-    for (int i = 0; i < 128; i++) if (g_released_ids[i] == id) g_released_ids[i] = 0;
++    struct wl_client *client = wl_resource_get_client(buffer);
++    for (int i = 0; i < 128; i++)
++        if (g_released_ids[i].client == client && g_released_ids[i].id == id)
++            g_released_ids[i].id = 0;
+     if (g_buf_trace_left > 0) { g_buf_trace_left--; droiddeck_log("buffer", "attach id %u", id); }
+ }
+ static void buf_trace_release(struct wl_resource *buffer, int line) {
+     if (!buffer || !buf_trace_on()) return;
+     uint32_t id = wl_resource_get_id(buffer);
++    struct wl_client *client = wl_resource_get_client(buffer);
+     int twice = 0, slot = -1;
+     for (int i = 0; i < 128; i++) {
+-        if (g_released_ids[i] == id) twice = 1;
+-        if (slot < 0 && g_released_ids[i] == 0) slot = i;
++        if (g_released_ids[i].client == client && g_released_ids[i].id == id) twice = 1;
++        if (slot < 0 && g_released_ids[i].id == 0) slot = i;
+     }
+     if (twice) droiddeck_log("buffer", "DOUBLE release id %u (line %d): released again without an attach", id, line);
+-    else if (slot >= 0) g_released_ids[slot] = id;
++    else if (slot >= 0) { g_released_ids[slot].client = client; g_released_ids[slot].id = id; }
+     if (g_buf_trace_left > 0) { g_buf_trace_left--; droiddeck_log("buffer", "release id %u (line %d)", id, line); }
+ }
+ 
+ #define send_buffer_release(b) send_buffer_release_at((b), __LINE__)
++static void pending_releases_cancel(struct wl_resource *buffer);
+ static void send_buffer_release_at(struct wl_resource *buffer, int line) {
+-    if (!buffer_release_blocked(buffer)) { buf_trace_release(buffer, line); wl_buffer_send_release(buffer); }
++    if (!buffer_release_blocked(buffer)) {
++        pending_releases_cancel(buffer);
++        buf_trace_release(buffer, line);
++        wl_buffer_send_release(buffer);
++    }
+ }
+ 
+ /* Whether a surface other than `except` is showing this buffer right now. gamescope's Wayland
+@@ -415,6 +424,16 @@ static void arm_release_timer(void) {
+     timerfd_settime(g_release_timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
+ }
+ 
++static void pending_releases_cancel(struct wl_resource *buffer) {
++    struct pending_release *pr;
++    wl_list_for_each(pr, &g_pending_releases, link) {
++        if (pr->buffer != buffer) continue;
++        pending_release_free(pr);
++        arm_release_timer();
++        return;
++    }
++}
++
+ static int on_release_timer(int fd, uint32_t mask, void *data) {
+     struct pending_release *pr, *tmp;
+     uint64_t expirations;
+@@ -427,9 +446,11 @@ static int on_release_timer(int fd, uint32_t mask, void *data) {
+                 pending_release_free(pr);
+                 continue;
+             }
+-            send_buffer_release(pr->buffer);
+-            perf_note_release(pr->since_ns);
++            struct wl_resource *buffer = pr->buffer;
++            int64_t since_ns = pr->since_ns;
+             pending_release_free(pr);
++            send_buffer_release(buffer);
++            perf_note_release(since_ns);
+         }
+     }
+     wl_display_flush_clients(g_display);
+@@ -441,6 +462,9 @@ static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_
+     /* No allocation or immediate-release fallback is allowed for a quarantined
+      * DMA-BUF. Existing queued releases stay held; their timer is disarmed. */
+     if (buffer_release_blocked(buffer)) return;
++    struct pending_release *queued;
++    wl_list_for_each(queued, &g_pending_releases, link)
++        if (queued->buffer == buffer) return;
+     const int limit = g_fps_limit;
+     const int64_t interval = limit > 0 ? 1000000000LL / limit : g_refresh_ns;
+     if (interval <= 0 || g_release_timer_fd < 0) { send_buffer_release(buffer); perf_note_release(since_ns); return; }
+@@ -857,6 +881,7 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
+     s->pending_buffer = buffer;
+     s->pending_attach = 1;
+     if (buffer) {
++        buf_trace_attach(buffer);
+         s->pending_buffer_destroy.notify = on_pending_buffer_destroyed;
+         wl_resource_add_destroy_listener(buffer, &s->pending_buffer_destroy);
+     }
+@@ -1061,7 +1086,6 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
+         } else if (s->role == ROLE_NONE) {
+             if (buffer) surface_hold_idle(s, buffer);
+         } else if (db) {
+-            buf_trace_attach(buffer);
+             take_dmabuf(s, db, buffer);
+         } else if (shm) {
+             drop_dmabuf(s, 1);
+diff --git a/tools/tests/test_buffer_release_trace.py b/tools/tests/test_buffer_release_trace.py
+new file mode 100644
+index 0000000..c917215
+--- /dev/null
++++ b/tools/tests/test_buffer_release_trace.py
+@@ -0,0 +1,117 @@
++"""Exercise real attach/trace functions with a recording protocol endpoint."""
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from test_vk_pending_completion import function
++
++ROOT = Path(__file__).resolve().parents[2]
++SOURCE = ROOT / 'app/src/main/cpp/waylandcomp/src/compositor.c'
++
++HARNESS = r'''
++#include <assert.h>
++#include <stdint.h>
++#include <stdarg.h>
++#include <string.h>
++#include <unistd.h>
++struct wl_list { struct wl_list *prev, *next; };
++struct wl_client { int id; };
++struct wl_resource;
++struct wl_listener { struct wl_list link; void (*notify)(struct wl_listener *, void *); };
++struct wl_resource { uint32_t id; struct wl_client *client; void *data; };
++struct surface {
++    struct wl_resource *pending_buffer;
++    struct wl_listener pending_buffer_destroy;
++    int pending_attach;
++};
++static unsigned warnings;
++static void wl_list_init(struct wl_list *l) { l->next = l->prev = l; }
++static void wl_list_remove(struct wl_list *l) { l->next->prev = l->prev; l->prev->next = l->next; }
++static uint32_t wl_resource_get_id(struct wl_resource *r) { return r->id; }
++static struct wl_client *__attribute__((unused)) wl_resource_get_client(struct wl_resource *r) { return r->client; }
++static void *wl_resource_get_user_data(struct wl_resource *r) { return r->data; }
++static void wl_resource_add_destroy_listener(struct wl_resource *r, struct wl_listener *l) {
++    (void)r; wl_list_init(&l->link);
++}
++static void on_pending_buffer_destroyed(struct wl_listener *l, void *data) { (void)l; (void)data; }
++static int no_adreno(const char *p, int mode) { (void)p; (void)mode; return -1; }
++#define access no_adreno
++static void droiddeck_log(const char *tag, const char *fmt, ...) {
++    (void)tag;
++    if (strstr(fmt, "DOUBLE release")) ++warnings;
++}
++/* PRODUCTION_FUNCTIONS */
++int main(int argc, char **argv) {
++    assert(argc == 2);
++    (void)buf_trace_attach;
++    (void)wl_resource_get_client;
++    struct wl_client a = {1}, b = {2};
++    struct surface s = {0};
++    struct wl_resource sr = {.data = &s};
++    struct wl_resource first = {.id = 74, .client = &a};
++    struct wl_resource second = {.id = 74, .client = &b};
++    if (!strcmp(argv[1], "reattach")) {
++        surface_attach(&a, &sr, &first, 0, 0);
++        buf_trace_release(&first, 732);
++        surface_attach(&a, &sr, &first, 0, 0);
++        buf_trace_release(&first, 732);
++        assert(!warnings);
++    } else if (!strcmp(argv[1], "clients")) {
++        buf_trace_attach(&first);
++        buf_trace_release(&first, 1);
++        buf_trace_attach(&second);
++        buf_trace_release(&first, 1);
++        assert(warnings == 1);
++        buf_trace_release(&second, 1);
++        assert(warnings == 1);
++    } else if (!strcmp(argv[1], "duplicate")) {
++        surface_attach(&a, &sr, &first, 0, 0);
++        buf_trace_release(&first, 1);
++        buf_trace_release(&first, 1);
++        assert(warnings == 1);
++    } else assert(0);
++    return 0;
++}
++'''
++
++
++class BufferReleaseTraceTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cc = shutil.which(os.environ.get('CC', 'cc'))
++        if not cc:
++            raise AssertionError('C compiler required')
++        source = Path(os.environ.get('DROIDDECK_BUFFER_TRACE_SOURCE', SOURCE)).read_text()
++        start = source.index('static int g_buf_trace =')
++        end = source.index('#define send_buffer_release', start)
++        body = source[start:end] + function(source, 'surface_attach')
++        cls.tmp = tempfile.TemporaryDirectory(prefix='droiddeck-buffer-trace-')
++        cls.addClassCleanup(cls.tmp.cleanup)
++        probe = Path(cls.tmp.name) / 'probe.c'
++        probe.write_text(HARNESS.replace('/* PRODUCTION_FUNCTIONS */', body))
++        cls.binary = probe.with_suffix('')
++        built = subprocess.run([cc, '-std=c11', '-Wall', '-Wextra', '-Werror',
++                                '-Wno-unused-parameter', '-UNDEBUG', str(probe),
++                                '-o', str(cls.binary)], capture_output=True, text=True)
++        if built.returncode:
++            raise AssertionError(built.stdout + built.stderr)
++
++    def check_case(self, name):
++        result = subprocess.run([str(self.binary), name], capture_output=True, text=True, timeout=10)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_shm_and_pixel_reattach_is_not_a_duplicate_release(self):
++        self.check_case('reattach')
++
++    def test_buffer_ids_are_scoped_to_their_client(self):
++        self.check_case('clients')
++
++    def test_actual_duplicate_is_still_reported(self):
++        self.check_case('duplicate')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tools/tests/test_vk_dmabuf_quarantine.py b/tools/tests/test_vk_dmabuf_quarantine.py
+index f954a2e..0dd20d9 100644
+--- a/tools/tests/test_vk_dmabuf_quarantine.py
++++ b/tools/tests/test_vk_dmabuf_quarantine.py
+@@ -41,6 +41,8 @@ class VkDmabufQuarantineTest(unittest.TestCase):
+             if re.search(r'\bstatic void send_buffer_release_at\(', comp):
+                 # send_buffer_release is a macro over send_buffer_release_at (with buffer tracing).
+                 helpers += ['static void buf_trace_release(struct wl_resource *b, int line) { (void)b; (void)line; }',
++                            ('static void pending_releases_cancel(struct wl_resource *buffer);'
++                             if re.search(r'\bstatic void pending_releases_cancel\(', comp) else ''),
+                             '#define send_buffer_release(b) send_buffer_release_at((b), __LINE__)',
+                             function(comp, 'send_buffer_release_at')]
+             else:
+@@ -48,9 +50,10 @@ class VkDmabufQuarantineTest(unittest.TestCase):
+         else:
+             helpers = ['static int __attribute__((unused)) buffer_release_blocked(struct wl_resource *b) { (void)b; return 0; }']
+         if re.search(r'\bstatic int buffer_shown_elsewhere\(', comp):
+-            # One surface per buffer in these scenarios: never shown elsewhere.
+             helpers += ['static int buffer_shown_elsewhere(struct wl_resource *b, const struct surface *e) '
+-                        '{ (void)b; (void)e; return 0; }']
++                        '{ (void)e; return b == shown_buffer; }']
++        if re.search(r'\bstatic void pending_releases_cancel\(', comp):
++            names.insert(names.index('on_release_timer'), 'pending_releases_cancel')
+         query = function(vk, 'vkp_completion_unknown') if 'int vkp_completion_unknown(' in vk else \
+             'int vkp_completion_unknown(void) { return g_dev_state == -3; }'
+         comp_functions = [function(comp, names[0])] + helpers + [function(comp, n) for n in names[1:]]
+@@ -112,6 +115,15 @@ class VkDmabufQuarantineTest(unittest.TestCase):
+     def test_genuine_device_loss_keeps_existing_cleanup(self):
+         self.run_scenario('device-lost')
+ 
++    def test_reattached_buffer_has_only_one_queued_release(self):
++        self.run_scenario('reattached')
++
++    def test_immediate_release_consumes_an_older_queued_release(self):
++        self.run_scenario('immediate-after-queued')
++
++    def test_buffer_still_shown_is_not_released_by_timer(self):
++        self.run_scenario('still-shown')
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tools/tests/vk_dmabuf_quarantine_test.c b/tools/tests/vk_dmabuf_quarantine_test.c
+index cbcf724..3a03f0f 100644
+--- a/tools/tests/vk_dmabuf_quarantine_test.c
++++ b/tools/tests/vk_dmabuf_quarantine_test.c
+@@ -16,6 +16,7 @@ struct itimerspec { struct timespec it_interval, it_value; };
+ 
+ struct wl_listener { struct wl_list link; void (*notify)(struct wl_listener *, void *); };
+ struct wl_resource { int dma; void *user_data; struct wl_list listeners; unsigned releases; };
++static struct wl_resource *shown_buffer;
+ struct wl_client;
+ struct wl_event_source { int unused; };
+ typedef struct AHardwareBuffer { int unused; } AHardwareBuffer;
+@@ -179,6 +180,51 @@ static void test_cleanup(int lost) {
+     destroy_resource(&r); assert(image_destroys == 1);
+     errno = 0; assert(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+ }
++static void test_reattached(void) {
++    struct surface first, second; struct wl_resource r;
++    struct dmabuf_buffer *b = init_buffer(&first, &r);
++    g_release_timer_fd = 123; g_refresh_ns = 100000;
++    drop_dmabuf(&first, 1);
++    second = (struct surface){.dmabuf = &r, .dmabuf_buf = b};
++    ++b->refs;
++    second.dmabuf_destroy.notify = on_dmabuf_destroyed;
++    wl_resource_add_destroy_listener(&r, &second.dmabuf_destroy);
++    drop_dmabuf(&second, 1);
++    assert(first.releases_pending + second.releases_pending == 1);
++    fire_timer();
++    assert(r.releases == 1 && g_pending_releases.next == &g_pending_releases);
++    assert(!first.releases_pending && !second.releases_pending);
++    destroy_resource(&r);
++}
++
++static void test_immediate_after_queued(void) {
++    struct surface s; struct wl_resource r;
++    init_buffer(&s, &r);
++    g_release_timer_fd = 123; g_refresh_ns = 100000;
++    drop_dmabuf(&s, 1);
++    assert(s.releases_pending == 1);
++    droiddeck_release_buffer(NULL, &r, 0, now_ns());
++    assert(r.releases == 1 && !s.releases_pending && g_pending_releases.next == &g_pending_releases);
++    fire_timer();
++    assert(r.releases == 1);
++    destroy_resource(&r);
++}
++
++static void test_still_shown(void) {
++    struct surface s; struct wl_resource r;
++    init_buffer(&s, &r);
++    g_release_timer_fd = 123; g_refresh_ns = 100000;
++    drop_dmabuf(&s, 1);
++    shown_buffer = &r;
++    fire_timer();
++    assert(!r.releases && !s.releases_pending);
++    shown_buffer = NULL;
++    release_buffer(&s, &r, now_ns());
++    fire_timer();
++    assert(r.releases == 1 && !s.releases_pending);
++    destroy_resource(&r);
++}
++
+ int main(int argc, char **argv) {
+     assert(argc == 2);
+     wl_list_init(&g_pending_releases); wl_list_init(&g_bufs);
+@@ -194,6 +240,9 @@ int main(int argc, char **argv) {
+     else if (!strcmp(argv[1], "active-client-gone")) test_active_client_destroy();
+     else if (!strcmp(argv[1], "healthy")) test_cleanup(0);
+     else if (!strcmp(argv[1], "device-lost")) test_cleanup(1);
++    else if (!strcmp(argv[1], "reattached")) test_reattached();
++    else if (!strcmp(argv[1], "immediate-after-queued")) test_immediate_after_queued();
++    else if (!strcmp(argv[1], "still-shown")) test_still_shown();
+     else assert(0 && "unknown scenario");
+     return 0;
+ }
