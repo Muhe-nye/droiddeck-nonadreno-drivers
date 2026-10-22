@@ -39,6 +39,14 @@ jobs:
           echo "DD_NDK=$NDK_PATH" >> "$GITHUB_ENV"
       - name: Build display module with frame generation engines
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('droiddeck-source/app/src/main/cpp/CMakeLists.txt')
+          source = p.read_text()
+          excluded = 'add_subdirectory(questxr)\n'
+          assert source.count(excluded) == 1
+          p.write_text(source.replace(excluded, ''))
+          PY
           cmake -S droiddeck-source/app/src/main/cpp -B native-build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$DD_NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
@@ -49,11 +57,12 @@ jobs:
           mkdir module
           cp native-build/waylandcomp/libdroiddeckwayland.so module/
           cp patches/droiddeck-buffer-release/buffer-release.patch module/
+          git -C droiddeck-source diff -- app/src/main/cpp/CMakeLists.txt > module/build-scope.patch
           printf 'DD source: %s\nPatch repository commit: %s\nNDK: %s\nABI: arm64-v8a\n' \
             9ae771c50d575fa94de93c577e5d8bc653011a68 "$GITHUB_SHA" 27.3.13750724 > module/provenance.txt
           "$DD_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d -h module/libdroiddeckwayland.so > module/elf-info.txt
           cd module
-          sha256sum libdroiddeckwayland.so buffer-release.patch provenance.txt elf-info.txt > SHA256SUMS
+          sha256sum libdroiddeckwayland.so buffer-release.patch build-scope.patch provenance.txt elf-info.txt > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: dd-buffer-release-arm64

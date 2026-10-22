@@ -23,6 +23,9 @@ phone's black screen is fixed. Device comparison is still required.
 The `DD buffer release test module` workflow applies the patch, runs these tests,
 and builds the full `droiddeckwayland` target (including the frame-generation
 engines) with NDK 27.3.13750724. The artifact includes SHA256 checksums and source
-provenance. It is a rooted-device experimental native module, not an installable
+provenance. The build omits the unrelated Quest XR CMake subdirectory, which
+normally receives OpenXR from Gradle's Prefab integration; the display target does
+not link it. This build-only edit is recorded separately in `build-scope.patch`.
+It is a rooted-device experimental native module, not an installable
 APK or a PanVK driver. Back up the existing module and retain app data before
 device testing. Reinstalling/updating the app replaces a temporary module change.
