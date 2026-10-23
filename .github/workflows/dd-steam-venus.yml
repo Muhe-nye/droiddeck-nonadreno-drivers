@@ -1,0 +1,38 @@
+name: Test Steam Venus compositing patch
+
+on:
+  push:
+    branches: [fix/g925-steam-compositing]
+    paths:
+      - .github/workflows/dd-steam-venus.yml
+      - patches/droiddeck-steam-venus/**
+  pull_request:
+    paths:
+      - .github/workflows/dd-steam-venus.yml
+      - patches/droiddeck-steam-venus/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Droid-Deck/DroidDeck
+          ref: 9ae771c50d575fa94de93c577e5d8bc653011a68
+          path: droiddeck-source
+      - name: Apply launch policy patch
+        run: |
+          git -C droiddeck-source apply --check ../patches/droiddeck-steam-venus/steam-venus-software-compositing.patch
+          git -C droiddeck-source apply ../patches/droiddeck-steam-venus/steam-venus-software-compositing.patch
+      - name: Verify launch arguments and shell syntax
+        working-directory: droiddeck-source
+        run: |
+          python3 tools/tests/test_steam_presentation.py -v
+          bash -n tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+          git diff --check

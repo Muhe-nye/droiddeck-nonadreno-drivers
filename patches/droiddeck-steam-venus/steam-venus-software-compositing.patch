@@ -1,0 +1,50 @@
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+index 03a165f..428fc72 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+@@ -916,9 +916,9 @@ BUSCONF
+       bl_steam_angle=gl
+       bl_steam_presentation=(-cef-disable-gpu-compositing)
+       echo "== steam: system PowerVR uses OpenGL/DRI3 through Zink with software CEF compositing"
+-    elif [ "${BL_STEAM_SOFT_COMPOSITING:-}" = 1 ]; then
++    elif [ "${BL_STEAM_SOFT_COMPOSITING:-}" = 1 ] || [ "${BL_VENUS:-0}" = 1 ]; then
+       bl_steam_presentation=(-cef-disable-gpu-compositing)
+-      echo "== steam: open driver pair - software CEF compositing, GPU raster"
++      echo "== steam: software CEF compositing (open driver pair or Venus)"
+     fi
+     _bl_cef=(-cef-force-gpu "${bl_steam_presentation[@]}" -cef-use-gl=angle "-cef-use-angle=$bl_steam_angle")
+     decky_loader=$HOME/homebrew/services/PluginLoader
+diff --git a/tools/tests/test_steam_presentation.py b/tools/tests/test_steam_presentation.py
+index fc1b6fe..8f817b7 100644
+--- a/tools/tests/test_steam_presentation.py
++++ b/tools/tests/test_steam_presentation.py
+@@ -21,7 +21,8 @@ class SteamPresentationTest(unittest.TestCase):
+                   + 'steam_client=("$steam_root/steamrtarm64/steam")\n'
+                   + source[command:command_end])
+         env = dict(os.environ)
+-        for key in ("BL_STEAM_GL_PRESENT", "DISABLE_GAMESCOPE_WSI", "LIBGL_KOPPER_DISABLE"):
++        for key in ("BL_STEAM_GL_PRESENT", "BL_STEAM_SOFT_COMPOSITING", "BL_VENUS",
++                    "DISABLE_GAMESCOPE_WSI", "LIBGL_KOPPER_DISABLE"):
+             env.pop(key, None)
+         if enabled is not None:
+             env["BL_STEAM_GL_PRESENT"] = enabled
+@@ -70,6 +71,19 @@ class SteamPresentationTest(unittest.TestCase):
+         self.assertEqual(result["disable"], "0")
+         self.assertEqual(result["kopper"], "false")
+ 
++    def test_venus_defaults_to_software_web_compositing(self):
++        result = self.launch(inherited={"BL_VENUS": "1"})
++        self.assertIn("-cef-disable-gpu-compositing", result["args"])
++        self.assertIn("-cef-use-angle=vulkan", result["args"])
++        self.assertIsNone(result["disable"])
++        self.assertIsNone(result["kopper"])
++
++    def test_explicit_software_compositing_keeps_existing_driver_path(self):
++        result = self.launch(inherited={"BL_STEAM_SOFT_COMPOSITING": "1", "BL_VENUS": "0"})
++        self.assertIn("-cef-disable-gpu-compositing", result["args"])
++        self.assertIn("-cef-use-angle=vulkan", result["args"])
++        self.assertIsNone(result["disable"])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
